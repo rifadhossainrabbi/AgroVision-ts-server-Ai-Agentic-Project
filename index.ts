@@ -79,6 +79,8 @@ async function run() {
     const likesCollection = db.collection('likes');
     const commentsCollection = db.collection('comments');
     const usersCollection = db.collection('user');
+    const buyRequestsCollection = db.collection('buyRequests');
+    const cartCollection = db.collection('cart');
 
     console.log('✅ AGROVISION DB: CONNECTED AND SYNCHRONIZED');
 
@@ -130,21 +132,27 @@ async function run() {
       }
     });
 
-    // A3. Delete Product (FIXED TYPE ERROR)
+    // Helper: Cascading Product Deletion
+    async function deleteProductCascading(productId: string) {
+      if (ObjectId.isValid(productId)) {
+        await productsCollection.deleteOne({ _id: new ObjectId(productId) });
+      }
+      await productsCollection.deleteOne({ _id: productId });
+      await likesCollection.deleteMany({ productId });
+      await commentsCollection.deleteMany({ productId });
+      await cartCollection.deleteMany({ productId });
+      await buyRequestsCollection.deleteMany({ productId });
+    }
+
+    // A3. Delete Product (Cascading Deletion of related likes, comments, cart, orders)
     app.delete('/api/products/:id', async (req: Request, res: Response) => {
       try {
-        const id = req.params.id as string; // Explicit cast to string
-
-        if (!ObjectId.isValid(id)) {
-          return res
-            .status(400)
-            .send({ success: false, message: 'Invalid ID format' });
-        }
-
-        const result = await productsCollection.deleteOne({
-          _id: new ObjectId(id),
+        const id = req.params.id as string;
+        await deleteProductCascading(id);
+        res.send({
+          success: true,
+          message: 'Product and all associated data deleted successfully',
         });
-        res.send({ success: true, message: 'Deleted successfully', result });
       } catch (error: any) {
         res.status(500).send({ success: false, error: error.message });
       }
@@ -174,7 +182,7 @@ async function run() {
       }
     });
 
-    // A5. Marketplace All Products (Fixed Search & Status)
+    // A5. Marketplace All Products (Strictly approved 'active' products for public view)
     app.get('/api/products/all', async (req: Request, res: Response) => {
       try {
         const { search, type, category, page } = req.query;
@@ -182,7 +190,7 @@ async function run() {
         const limit = 8;
         const skip = (pageNum - 1) * limit;
 
-        let query: any = { status: { $in: ['active', 'pending'] } };
+        let query: any = { status: 'active' };
 
         if (type && type !== 'All') query.productType = type;
         if (category && category !== 'All')
@@ -309,6 +317,135 @@ async function run() {
         });
       } catch (error: any) {
         res.status(500).send({ error: error.message });
+      }
+    });
+    /**
+     * A7. ADMIN MANAGEMENT ROUTES
+     */
+
+    // A7-1. Admin Get All Products (Includes pending, active, rejected with pagination & filtering)
+    app.get('/api/admin/products/all', async (req: Request, res: Response) => {
+      try {
+        const { search, type, category, status, page } = req.query;
+        const pageNum = parseInt(page as string) || 1;
+        const limit = 10;
+        const skip = (pageNum - 1) * limit;
+
+        let query: any = {};
+        if (status && status !== 'All') query.status = status;
+        if (type && type !== 'All') query.productType = type;
+        if (category && category !== 'All')
+          query.category = { $regex: `^${category}$`, $options: 'i' };
+        if (search) query.title = { $regex: search as string, $options: 'i' };
+
+        const products = await productsCollection
+          .find(query)
+          .sort({ createdAt: -1 })
+          .skip(skip)
+          .limit(limit)
+          .toArray();
+        const total = await productsCollection.countDocuments(query);
+
+        res.send({
+          success: true,
+          products,
+          totalPages: Math.ceil(total / limit),
+          currentPage: pageNum,
+          totalProducts: total,
+        });
+      } catch (error: any) {
+        res.status(500).send({ error: error.message });
+      }
+    });
+
+    // A7-2. Admin Update Product Status (Approve / Reject / Pending)
+    app.patch('/api/admin/products/:id/status', async (req: Request, res: Response) => {
+      try {
+        const id = req.params.id as string;
+        const { status } = req.body;
+
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).send({ success: false, message: 'Invalid ID format' });
+        }
+
+        const result = await productsCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $set: { status, updatedAt: new Date() } }
+        );
+
+        res.send({
+          success: true,
+          message: `Product status updated to ${status}`,
+          result,
+        });
+      } catch (error: any) {
+        res.status(500).send({ success: false, error: error.message });
+      }
+    });
+
+    // A7-3. Admin Get All Users
+    app.get('/api/admin/users', async (req: Request, res: Response) => {
+      try {
+        const users = await usersCollection
+          .find({})
+          .sort({ createdAt: -1 })
+          .toArray();
+        res.send({ success: true, users });
+      } catch (error: any) {
+        res.status(500).send({ success: false, error: error.message });
+      }
+    });
+
+    // A7-4. Admin Delete User (Cascading deletion of user's products, comments, likes, cart, orders)
+    app.delete('/api/admin/users/:userId', async (req: Request, res: Response) => {
+      try {
+        const userId = req.params.userId as string;
+
+        // 1. Delete all products created by user & run cascading deletion for each
+        const userProducts = await productsCollection.find({ userId }).toArray();
+        for (const p of userProducts) {
+          await deleteProductCascading(p._id.toString());
+        }
+
+        // 2. Delete user from usersCollection
+        if (ObjectId.isValid(userId)) {
+          await usersCollection.deleteOne({ _id: new ObjectId(userId) });
+        }
+        await usersCollection.deleteOne({ _id: userId });
+        await usersCollection.deleteOne({ id: userId });
+
+        // 3. Delete comments left by this user
+        await commentsCollection.deleteMany({ userId });
+
+        // 4. Remove user from likesCollection
+        const allLikes = await likesCollection.find({}).toArray();
+        for (const doc of allLikes) {
+          const updatedLikedBy = (doc.likedBy || []).filter(
+            (u: any) =>
+              !(
+                (typeof u === 'object' && (u.userId === userId || u.userName === userId)) ||
+                u === userId
+              )
+          );
+          await likesCollection.updateOne(
+            { _id: doc._id },
+            { $set: { likedBy: updatedLikedBy } }
+          );
+        }
+
+        // 5. Remove user from cartCollection & buyRequestsCollection
+        await cartCollection.updateMany({}, { $pull: { users: { userId } } });
+        await cartCollection.deleteMany({ users: { $size: 0 } });
+
+        await buyRequestsCollection.updateMany({}, { $pull: { users: { userId } } });
+        await buyRequestsCollection.deleteMany({ users: { $size: 0 } });
+
+        res.send({
+          success: true,
+          message: 'User and all associated data deleted successfully',
+        });
+      } catch (error: any) {
+        res.status(500).send({ success: false, error: error.message });
       }
     });
 
@@ -479,34 +616,54 @@ Assistant:`;
 
     app.post('/api/likes/toggle', async (req: Request, res: Response) => {
       try {
-        const { productId, userName } = req.body;
+        const { productId, userId, userName } = req.body;
         const existing = await likesCollection.findOne({ productId });
 
+        const userObj = {
+          userId: userId || 'anonymous',
+          userName: userName || 'Anonymous',
+        };
+
         if (!existing) {
-          await likesCollection.insertOne({ productId, likedBy: [userName] });
+          await likesCollection.insertOne({ productId, likedBy: [userObj] });
           return res.send({ success: true, liked: true, likesCount: 1 });
         }
 
-        const alreadyLiked = existing.likedBy.includes(userName);
+        const likedByList: any[] = existing.likedBy || [];
+        const alreadyLiked = likedByList.some(
+          (u: any) =>
+            (typeof u === 'object' &&
+              (u.userId === userId || u.userName === userName)) ||
+            u === userName,
+        );
+
         if (alreadyLiked) {
+          const updatedList = likedByList.filter(
+            (u: any) =>
+              !(
+                (typeof u === 'object' &&
+                  (u.userId === userId || u.userName === userName)) ||
+                u === userName
+              ),
+          );
           await likesCollection.updateOne(
             { productId },
-            { $pull: { likedBy: userName } },
+            { $set: { likedBy: updatedList } },
           );
           res.send({
             success: true,
             liked: false,
-            likesCount: existing.likedBy.length - 1,
+            likesCount: updatedList.length,
           });
         } else {
           await likesCollection.updateOne(
             { productId },
-            { $push: { likedBy: userName } },
+            { $push: { likedBy: userObj } },
           );
           res.send({
             success: true,
             liked: true,
-            likesCount: existing.likedBy.length + 1,
+            likesCount: likedByList.length + 1,
           });
         }
       } catch (error: any) {
@@ -518,12 +675,19 @@ Assistant:`;
       const doc = await likesCollection.findOne({
         productId: req.params.productId,
       });
-      const likedBy = doc?.likedBy || [];
+      const likedBy: any[] = doc?.likedBy || [];
+      const { userId, userName } = req.query;
+
+      const isLiked = likedBy.some(
+        (u: any) =>
+          (typeof u === 'object' &&
+            (u.userId === userId || u.userName === userName)) ||
+          u === userName,
+      );
+
       res.send({
         likesCount: likedBy.length,
-        isLiked: req.query.userName
-          ? likedBy.includes(req.query.userName)
-          : false,
+        isLiked: Boolean(isLiked),
       });
     });
 
@@ -561,7 +725,354 @@ Assistant:`;
       await commentsCollection.deleteOne({ _id: new ObjectId(id) });
       res.send({ success: true, message: 'Comment deleted' });
     });
-  } catch (error) {
+
+    /**
+     * C. BUY REQUESTS & ORDERS ROUTES
+     */
+
+    // C1. Submit Buy Request (Buy Now)
+    app.post('/api/buy-requests', async (req: Request, res: Response) => {
+      try {
+        const {
+          productId,
+          productTitle,
+          mainImage,
+          price,
+          unit,
+          sellerId,
+          sellerName,
+          user,
+        } = req.body;
+
+        if (!productId || !user?.userId) {
+          return res
+            .status(400)
+            .send({ success: false, error: 'Product ID and User info required' });
+        }
+
+        const existingDoc = await buyRequestsCollection.findOne({ productId });
+
+        if (existingDoc) {
+          const userAlreadyInArray = existingDoc.users?.some(
+            (u: any) => u.userId === user.userId,
+          );
+
+          if (userAlreadyInArray) {
+            return res.send({
+              success: true,
+              message: 'Already submitted buy request for this product',
+              alreadyExists: true,
+            });
+          }
+
+          await buyRequestsCollection.updateOne(
+            { productId },
+            {
+              $push: {
+                users: {
+                  userId: user.userId,
+                  userName: user.userName || 'Anonymous',
+                  userEmail: user.userEmail || '',
+                  userImage: user.userImage || '',
+                  status: 'pending',
+                  createdAt: new Date(),
+                },
+              },
+            },
+          );
+        } else {
+          await buyRequestsCollection.insertOne({
+            productId,
+            productTitle: productTitle || 'Agro Product',
+            mainImage: mainImage || '',
+            price: price || 0,
+            unit: unit || 'unit',
+            sellerId: sellerId || 'anonymous',
+            sellerName: sellerName || 'AgroVision Seller',
+            users: [
+              {
+                userId: user.userId,
+                userName: user.userName || 'Anonymous',
+                userEmail: user.userEmail || '',
+                userImage: user.userImage || '',
+                status: 'pending',
+                createdAt: new Date(),
+              },
+            ],
+            createdAt: new Date(),
+          });
+        }
+
+        res.status(201).send({
+          success: true,
+          message: 'Buy request submitted successfully',
+        });
+      } catch (error: any) {
+        res.status(500).send({ success: false, error: error.message });
+      }
+    });
+
+    // C2. Get Buy Requests by Buyer User ID (For "My Requests" page)
+    app.get('/api/buy-requests/user/:userId', async (req: Request, res: Response) => {
+      try {
+        const userId = req.params.userId as string;
+        const docs = await buyRequestsCollection
+          .find({ 'users.userId': userId })
+          .toArray();
+
+        const requests = docs.map((doc: any) => {
+          const userReq = doc.users?.find((u: any) => u.userId === userId);
+          return {
+            _id: doc._id.toString(),
+            productId: doc.productId,
+            productTitle: doc.productTitle,
+            mainImage: doc.mainImage,
+            price: doc.price,
+            unit: doc.unit,
+            sellerName: doc.sellerName,
+            status: userReq?.status || 'pending',
+            createdAt: userReq?.createdAt || doc.createdAt,
+          };
+        });
+
+        res.send({ success: true, requests });
+      } catch (error: any) {
+        res.status(500).send({ success: false, error: error.message });
+      }
+    });
+
+    // C3. Get Orders for Seller ID (For "My Orders" page)
+    app.get('/api/buy-requests/seller/:sellerId', async (req: Request, res: Response) => {
+      try {
+        const sellerId = req.params.sellerId as string;
+        const docs = await buyRequestsCollection
+          .find({ sellerId })
+          .toArray();
+
+        const orders: any[] = [];
+        docs.forEach((doc: any) => {
+          doc.users?.forEach((u: any) => {
+            orders.push({
+              _id: doc._id.toString(),
+              productId: doc.productId,
+              productTitle: doc.productTitle,
+              mainImage: doc.mainImage,
+              price: doc.price,
+              unit: doc.unit,
+              userId: u.userId,
+              userName: u.userName,
+              userEmail: u.userEmail,
+              userImage: u.userImage,
+              status: u.status,
+              createdAt: u.createdAt,
+            });
+          });
+        });
+
+        orders.sort(
+          (a, b) =>
+            new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
+        );
+
+        res.send({ success: true, orders });
+      } catch (error: any) {
+        res.status(500).send({ success: false, error: error.message });
+      }
+    });
+
+    // C4. Update Order Request Status (Accept / Reject)
+    app.patch('/api/buy-requests/status', async (req: Request, res: Response) => {
+      try {
+        const { productId, userId, status } = req.body;
+        if (!productId || !userId || !status) {
+          return res
+            .status(400)
+            .send({ success: false, error: 'productId, userId, status required' });
+        }
+
+        const result = await buyRequestsCollection.updateOne(
+          { productId, 'users.userId': userId },
+          { $set: { 'users.$.status': status } },
+        );
+
+        res.send({
+          success: true,
+          message: `Order status updated to ${status}`,
+          result,
+        });
+      } catch (error: any) {
+        res.status(500).send({ success: false, error: error.message });
+      }
+    });
+
+    // C5. Delete Buy Request by Buyer (Removes user from array)
+    app.delete(
+      '/api/buy-requests/:productId/:userId',
+      async (req: Request, res: Response) => {
+        try {
+          const productId = req.params.productId as string;
+          const userId = req.params.userId as string;
+
+          await buyRequestsCollection.updateOne(
+            { productId },
+            { $pull: { users: { userId } } },
+          );
+
+          // If no users left in users array, remove the document
+          await buyRequestsCollection.deleteOne({
+            productId,
+            users: { $size: 0 },
+          });
+
+          res.send({
+            success: true,
+            message: 'Buy request deleted successfully',
+          });
+        } catch (error: any) {
+          res.status(500).send({ success: false, error: error.message });
+        }
+      },
+    );
+
+    /**
+     * D. CART ROUTES
+     */
+
+    // D1. Add to Cart
+    app.post('/api/cart', async (req: Request, res: Response) => {
+      try {
+        const {
+          productId,
+          productTitle,
+          mainImage,
+          price,
+          unit,
+          category,
+          sellerId,
+          user,
+        } = req.body;
+
+        if (!productId || !user?.userId) {
+          return res
+            .status(400)
+            .send({ success: false, error: 'Product ID and User info required' });
+        }
+
+        const existingDoc = await cartCollection.findOne({ productId });
+
+        if (existingDoc) {
+          const userAlreadyInArray = existingDoc.users?.some(
+            (u: any) => u.userId === user.userId,
+          );
+
+          if (userAlreadyInArray) {
+            return res.send({
+              success: true,
+              message: 'Product is already in your cart',
+              alreadyExists: true,
+            });
+          }
+
+          await cartCollection.updateOne(
+            { productId },
+            {
+              $push: {
+                users: {
+                  userId: user.userId,
+                  userName: user.userName || 'Anonymous',
+                  userEmail: user.userEmail || '',
+                  userImage: user.userImage || '',
+                  addedAt: new Date(),
+                },
+              },
+            },
+          );
+        } else {
+          await cartCollection.insertOne({
+            productId,
+            productTitle: productTitle || 'Agro Product',
+            mainImage: mainImage || '',
+            price: price || 0,
+            unit: unit || 'unit',
+            category: category || 'General',
+            sellerId: sellerId || 'anonymous',
+            users: [
+              {
+                userId: user.userId,
+                userName: user.userName || 'Anonymous',
+                userEmail: user.userEmail || '',
+                userImage: user.userImage || '',
+                addedAt: new Date(),
+              },
+            ],
+            createdAt: new Date(),
+          });
+        }
+
+        res.status(201).send({
+          success: true,
+          message: 'Product added to cart successfully',
+        });
+      } catch (error: any) {
+        res.status(500).send({ success: false, error: error.message });
+      }
+    });
+
+    // D2. Get Cart Items by User ID
+    app.get('/api/cart/:userId', async (req: Request, res: Response) => {
+      try {
+        const userId = req.params.userId as string;
+        const docs = await cartCollection
+          .find({ 'users.userId': userId })
+          .toArray();
+
+        const cartItems = docs.map((doc: any) => {
+          const userCart = doc.users?.find((u: any) => u.userId === userId);
+          return {
+            _id: doc._id.toString(),
+            productId: doc.productId,
+            productTitle: doc.productTitle,
+            mainImage: doc.mainImage,
+            price: doc.price,
+            unit: doc.unit,
+            category: doc.category,
+            addedAt: userCart?.addedAt || doc.createdAt,
+          };
+        });
+
+        res.send({ success: true, cartItems });
+      } catch (error: any) {
+        res.status(500).send({ success: false, error: error.message });
+      }
+    });
+
+    // D3. Remove Item from Cart (Removes user from array)
+    app.delete(
+      '/api/cart/:productId/:userId',
+      async (req: Request, res: Response) => {
+        try {
+          const productId = req.params.productId as string;
+          const userId = req.params.userId as string;
+
+          await cartCollection.updateOne(
+            { productId },
+            { $pull: { users: { userId } } },
+          );
+
+          await cartCollection.deleteOne({
+            productId,
+            users: { $size: 0 },
+          });
+
+          res.send({
+            success: true,
+            message: 'Item removed from cart',
+          });
+        } catch (error: any) {
+          res.status(500).send({ success: false, error: error.message });
+        }
+      });
+    } catch (error) {
     console.error('❌ DATABASE ERROR:', error);
   }
 }
