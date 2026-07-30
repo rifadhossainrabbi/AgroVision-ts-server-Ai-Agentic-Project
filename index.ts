@@ -343,6 +343,20 @@ async function run() {
       }
     });
 
+    // A6B. Public Featured Products (Admin-curated, max 6, shown on home page)
+    app.get('/api/products/featured', async (req: Request, res: Response) => {
+      try {
+        const products = await productsCollection
+          .find({ status: 'active', isFeatured: true })
+          .sort({ featuredAt: -1 })
+          .limit(6)
+          .toArray();
+        res.send({ success: true, products });
+      } catch (error: any) {
+        res.status(500).send({ success: false, error: error.message });
+      }
+    });
+
     // A6. Single Product Detail (uses REAL data: specifications, seller, reviews)
     app.get('/api/products/:id', async (req: Request, res: Response) => {
       try {
@@ -515,6 +529,62 @@ async function run() {
       },
     );
 
+    // A7-2B. Admin Toggle "Featured" flag (Home Page Featured Section, max 6 at a time)
+    app.patch(
+      '/api/admin/products/:id/feature',
+      async (req: Request, res: Response) => {
+        try {
+          const id = req.params.id as string;
+          const { featured } = req.body;
+
+          if (!ObjectId.isValid(id)) {
+            return res
+              .status(400)
+              .send({ success: false, message: 'Invalid ID format' });
+          }
+
+          if (featured) {
+            const target = await productsCollection.findOne({
+              _id: new ObjectId(id),
+            });
+            if (!target?.isFeatured) {
+              const featuredCount = await productsCollection.countDocuments({
+                isFeatured: true,
+              });
+              if (featuredCount >= 6) {
+                return res.status(400).send({
+                  success: false,
+                  error:
+                    'Maximum 6 products can be featured on the home page. Please unfeature one first.',
+                });
+              }
+            }
+          }
+
+          const result = await productsCollection.updateOne(
+            { _id: new ObjectId(id) },
+            {
+              $set: {
+                isFeatured: !!featured,
+                featuredAt: featured ? new Date() : null,
+                updatedAt: new Date(),
+              },
+            },
+          );
+
+          res.send({
+            success: true,
+            message: featured
+              ? 'Product marked as featured on the home page'
+              : 'Product removed from the featured section',
+            result,
+          });
+        } catch (error: any) {
+          res.status(500).send({ success: false, error: error.message });
+        }
+      },
+    );
+
     // A7-3. Admin Get All Users
     app.get('/api/admin/users', async (req: Request, res: Response) => {
       try {
@@ -523,6 +593,30 @@ async function run() {
           .sort({ createdAt: -1 })
           .toArray();
         res.send({ success: true, users });
+      } catch (error: any) {
+        res.status(500).send({ success: false, error: error.message });
+      }
+    });
+
+    // A7-3B. Admin Get Single User (Profile + product count, for the user detail page)
+    app.get('/api/admin/users/:id', async (req: Request, res: Response) => {
+      try {
+        const id = req.params.id as string;
+        const user = await usersCollection.findOne(
+          ObjectId.isValid(id) ? { _id: new ObjectId(id) } : { _id: id },
+        );
+
+        if (!user) {
+          return res
+            .status(404)
+            .send({ success: false, error: 'User not found' });
+        }
+
+        const productCount = await productsCollection.countDocuments({
+          userId: id,
+        });
+
+        res.send({ success: true, user, productCount });
       } catch (error: any) {
         res.status(500).send({ success: false, error: error.message });
       }
@@ -1130,12 +1224,10 @@ Rules:
         } = req.body;
 
         if (!productId || !user?.userId) {
-          return res
-            .status(400)
-            .send({
-              success: false,
-              error: 'Product ID and User info required',
-            });
+          return res.status(400).send({
+            success: false,
+            error: 'Product ID and User info required',
+          });
         }
 
         const existingDoc = await buyRequestsCollection.findOne({ productId });
@@ -1279,12 +1371,10 @@ Rules:
         try {
           const { productId, userId, status } = req.body;
           if (!productId || !userId || !status) {
-            return res
-              .status(400)
-              .send({
-                success: false,
-                error: 'productId, userId, status required',
-              });
+            return res.status(400).send({
+              success: false,
+              error: 'productId, userId, status required',
+            });
           }
 
           const result = await buyRequestsCollection.updateOne(
@@ -1351,12 +1441,10 @@ Rules:
         } = req.body;
 
         if (!productId || !user?.userId) {
-          return res
-            .status(400)
-            .send({
-              success: false,
-              error: 'Product ID and User info required',
-            });
+          return res.status(400).send({
+            success: false,
+            error: 'Product ID and User info required',
+          });
         }
 
         const existingDoc = await cartCollection.findOne({ productId });
