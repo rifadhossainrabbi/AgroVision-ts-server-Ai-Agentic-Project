@@ -13,7 +13,7 @@ dotenv_1.default.config();
 const app = (0, express_1.default)();
 const port = process.env.PORT || 5000;
 // --- 1B. AI CONFIGURATION & HELPER ---
-// Powers the two Agentic AI features: (1) AI Content Generator and (2) AI Chat Assistant
+// Powers the two Agentic AI features: (1) AI Content Generator and (2) AI Chat Assistant.
 async function generateTextWithAI(prompt) {
     const grokApiKey = process.env.GROK_API_KEY;
     if (grokApiKey) {
