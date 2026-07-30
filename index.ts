@@ -182,6 +182,14 @@ app.use(
 );
 app.use(express.json({ limit: '10mb' }));
 
+app.get('/health', (_req: Request, res: Response) => {
+  res.json({
+    status: 'ok',
+    service: 'agro-vision-server-ts',
+    timestamp: new Date().toISOString(),
+  });
+});
+
 // --- 3. DATABASE CONNECTION ---
 const uri = process.env.MONGODB_URI as string;
 const client = new MongoClient(uri, {
