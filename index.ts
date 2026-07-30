@@ -176,7 +176,7 @@ function safeParseAIJson(raw: string): any {
 // --- 2. MIDDLEWARES ---
 app.use(
   cors({
-    origin: ['http://localhost:3000'],
+    origin: [process.env.NEXT_PUBLIC_URL || 'http://localhost:3000'],
     credentials: true,
   }),
 );

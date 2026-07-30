@@ -158,7 +158,7 @@ function safeParseAIJson(raw) {
 }
 // --- 2. MIDDLEWARES ---
 app.use((0, cors_1.default)({
-    origin: ['http://localhost:3000'],
+    origin: [process.env.NEXT_PUBLIC_URL || 'http://localhost:3000'],
     credentials: true,
 }));
 app.use(express_1.default.json({ limit: '10mb' }));
@@ -214,7 +214,7 @@ async function run() {
                         .send({ success: false, error: 'Unauthorized: no token provided' });
                 }
                 const token = authHeader.split(' ')[1];
-                console.log(token, "token");
+                console.log(token, 'token');
                 const session = await sessionCollection.findOne({ token });
                 if (!session) {
                     return res
@@ -259,7 +259,7 @@ async function run() {
             try {
                 const productData = {
                     ...req.body,
-                    status: 'active',
+                    status: 'pending',
                     createdAt: new Date(),
                     updatedAt: new Date(),
                 };
