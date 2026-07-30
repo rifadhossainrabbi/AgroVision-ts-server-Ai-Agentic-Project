@@ -1577,5 +1577,20 @@ Rules:
 
 run().catch(console.dir);
 
-app.get('/', (req, res) => res.send('🌾 AgroVision API is Live'));
-app.listen(port, () => console.log(`🚀 Server: http://localhost:${port}`));
+app.get('/', (_req: Request, res: Response) =>
+  res.send('🌾 AgroVision API is Live'),
+);
+
+const server = app.listen(port, () =>
+  console.log(`🚀 Server: http://localhost:${port}`),
+);
+
+const shutdown = () => {
+  server.close(() => {
+    console.log('🛑 Server stopped');
+    process.exit(0);
+  });
+};
+
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
