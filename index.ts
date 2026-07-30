@@ -1,4 +1,4 @@
-import express, { Request, Response } from 'express';
+import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import { MongoClient, ServerApiVersion, ObjectId } from 'mongodb';
@@ -216,56 +216,138 @@ async function run() {
     const cartCollection = db.collection('cart');
     const diagnosesCollection = db.collection('diagnoses');
     const farmAnalysesCollection = db.collection('farmAnalyses');
+    // better-auth (running on the Next.js app) writes its sessions into this
+    // same MongoDB database — we verify tokens by looking them up here rather
+    // than maintaining a separate JWT scheme.
+    const sessionCollection = db.collection('session');
 
     console.log('✅ AGROVISION DB: CONNECTED AND SYNCHRONIZED');
+
+    /**
+     * AUTH MIDDLEWARE
+     * Client sends the better-auth session token as: Authorization: Bearer <token>
+     * verifyToken checks it against the `session` collection and attaches
+     * req.userId. verifyAdmin (used after verifyToken) additionally checks
+     * that the user's role is 'admin'.
+     */
+    async function verifyToken(
+      req: Request,
+      res: Response,
+      next: NextFunction,
+    ) {
+      try {
+        const authHeader = req.headers.authorization;
+        console.log(authHeader, 'header')
+        if (!authHeader || !authHeader.startsWith('Bearer ')) {
+          return res
+            .status(401)
+            .send({ success: false, error: 'Unauthorized: no token provided' });
+        }
+
+        const token = authHeader.split(' ')[1];
+        console.log(token, "token")
+        const session = await sessionCollection.findOne({ token });
+
+        if (!session) {
+          return res
+            .status(401)
+            .send({ success: false, error: 'Unauthorized: invalid session' });
+        }
+
+        if (new Date(session.expiresAt).getTime() < Date.now()) {
+          return res
+            .status(401)
+            .send({ success: false, error: 'Unauthorized: session expired' });
+        }
+
+        (req as any).userId = session.userId?.toString();
+        next();
+      } catch (error: any) {
+        res.status(500).send({ success: false, error: error.message });
+      }
+    }
+
+    async function verifyAdmin(
+      req: Request,
+      res: Response,
+      next: NextFunction,
+    ) {
+      try {
+        const userId = (req as any).userId;
+        const user = await usersCollection.findOne({
+          _id: new ObjectId(userId),
+        });
+
+        if (!user || user.role !== 'admin') {
+          return res.status(403).send({
+            success: false,
+            error: 'Forbidden: admin access required',
+          });
+        }
+
+        next();
+      } catch (error: any) {
+        res.status(500).send({ success: false, error: error.message });
+      }
+    }
 
     /**
      * A. PRODUCT MANAGEMENT ROUTES
      */
 
     // A1. Add New Product
-    app.post('/api/products/add', async (req: Request, res: Response) => {
-      try {
-        const productData = {
-          ...req.body,
-          status: 'active',
-          createdAt: new Date(),
-          updatedAt: new Date(),
-        };
-        const result = await productsCollection.insertOne(productData);
-        res.status(201).send({ success: true, insertedId: result.insertedId });
-      } catch (error: any) {
-        res.status(500).send({ success: false, error: error.message });
-      }
-    });
+    app.post(
+      '/api/products/add',
+      verifyToken,
+      async (req: Request, res: Response) => {
+        try {
+          const productData = {
+            ...req.body,
+            status: 'active',
+            createdAt: new Date(),
+            updatedAt: new Date(),
+          };
+          const result = await productsCollection.insertOne(productData);
+          res
+            .status(201)
+            .send({ success: true, insertedId: result.insertedId });
+        } catch (error: any) {
+          res.status(500).send({ success: false, error: error.message });
+        }
+      },
+    );
 
     // A2. Get Products for specific user (Pagination)
-    app.get('/api/my-products/:userId', async (req: Request, res: Response) => {
-      try {
-        const userId = req.params.userId as string;
-        const page = parseInt(req.query.page as string) || 1;
-        const limit = 5;
-        const skip = (page - 1) * limit;
+    app.get(
+      '/api/my-products/:userId',
+      verifyToken,
+      async (req: Request, res: Response) => {
+        try {
+          const userId = req.params.userId as string;
+          const page = parseInt(req.query.page as string) || 1;
+          const limit = 5;
+          const skip = (page - 1) * limit;
 
-        const query = { userId: userId };
-        const products = await productsCollection
-          .find(query)
-          .sort({ createdAt: -1 })
-          .skip(skip)
-          .limit(limit)
-          .toArray();
-        const total = await productsCollection.countDocuments(query);
+          const query = { userId: userId };
+          const products = await productsCollection
+            .find(query)
+            .sort({ createdAt: -1 })
+            .skip(skip)
+            .limit(limit)
+            .toArray();
+          const total = await productsCollection.countDocuments(query);
 
-        res.send({
-          success: true,
-          products,
-          totalPages: Math.ceil(total / limit),
-          currentPage: page,
-        });
-      } catch (error: any) {
-        res.status(500).send({ success: false, error: error.message });
-      }
-    });
+          res.send({
+            success: true,
+            products,
+            totalPages: Math.ceil(total / limit),
+            currentPage: page,
+          });
+        } catch (error: any) {
+          res.status(500).send({ success: false, error: error.message });
+        }
+      },
+    );
 
     // Helper: Cascading Product Deletion
     async function deleteProductCascading(productId: string) {
@@ -280,42 +362,50 @@ async function run() {
     }
 
     // A3. Delete Product (Cascading Deletion of related likes, comments, cart, orders)
-    app.delete('/api/products/:id', async (req: Request, res: Response) => {
-      try {
-        const id = req.params.id as string;
-        await deleteProductCascading(id);
-        res.send({
-          success: true,
-          message: 'Product and all associated data deleted successfully',
-        });
-      } catch (error: any) {
-        res.status(500).send({ success: false, error: error.message });
-      }
-    });
+    app.delete(
+      '/api/products/:id',
+      verifyToken,
+      async (req: Request, res: Response) => {
+        try {
+          const id = req.params.id as string;
+          await deleteProductCascading(id);
+          res.send({
+            success: true,
+            message: 'Product and all associated data deleted successfully',
+          });
+        } catch (error: any) {
+          res.status(500).send({ success: false, error: error.message });
+        }
+      },
+    );
 
     // A4. Update Product (FIXED TYPE ERROR)
-    app.patch('/api/products/:id', async (req: Request, res: Response) => {
-      try {
-        const id = req.params.id as string; // Explicit cast to string
+    app.patch(
+      '/api/products/:id',
+      verifyToken,
+      async (req: Request, res: Response) => {
+        try {
+          const id = req.params.id as string; // Explicit cast to string
 
-        if (!ObjectId.isValid(id)) {
-          return res
-            .status(400)
-            .send({ success: false, message: 'Invalid ID format' });
+          if (!ObjectId.isValid(id)) {
+            return res
+              .status(400)
+              .send({ success: false, message: 'Invalid ID format' });
+          }
+
+          const updatedData = req.body;
+          delete updatedData._id;
+
+          const result = await productsCollection.updateOne(
+            { _id: new ObjectId(id) },
+            { $set: { ...updatedData, updatedAt: new Date() } },
+          );
+          res.send({ success: true, message: 'Updated successfully', result });
+        } catch (error: any) {
+          res.status(500).send({ success: false, error: error.message });
         }
-
-        const updatedData = req.body;
-        delete updatedData._id;
-
-        const result = await productsCollection.updateOne(
-          { _id: new ObjectId(id) },
-          { $set: { ...updatedData, updatedAt: new Date() } },
-        );
-        res.send({ success: true, message: 'Updated successfully', result });
-      } catch (error: any) {
-        res.status(500).send({ success: false, error: error.message });
-      }
-    });
+      },
+    );
 
     // A5. Marketplace All Products (Strictly approved 'active' products for public view)
     app.get('/api/products/all', async (req: Request, res: Response) => {
@@ -473,43 +563,50 @@ async function run() {
      */
 
     // A7-1. Admin Get All Products (Includes pending, active, rejected with pagination & filtering)
-    app.get('/api/admin/products/all', async (req: Request, res: Response) => {
-      try {
-        const { search, type, category, status, page } = req.query;
-        const pageNum = parseInt(page as string) || 1;
-        const limit = 10;
-        const skip = (pageNum - 1) * limit;
+    app.get(
+      '/api/admin/products/all',
+      verifyToken,
+      verifyAdmin,
+      async (req: Request, res: Response) => {
+        try {
+          const { search, type, category, status, page } = req.query;
+          const pageNum = parseInt(page as string) || 1;
+          const limit = 10;
+          const skip = (pageNum - 1) * limit;
 
-        let query: any = {};
-        if (status && status !== 'All') query.status = status;
-        if (type && type !== 'All') query.productType = type;
-        if (category && category !== 'All')
-          query.category = { $regex: `^${category}$`, $options: 'i' };
-        if (search) query.title = { $regex: search as string, $options: 'i' };
+          let query: any = {};
+          if (status && status !== 'All') query.status = status;
+          if (type && type !== 'All') query.productType = type;
+          if (category && category !== 'All')
+            query.category = { $regex: `^${category}$`, $options: 'i' };
+          if (search) query.title = { $regex: search as string, $options: 'i' };
 
-        const products = await productsCollection
-          .find(query)
-          .sort({ createdAt: -1 })
-          .skip(skip)
-          .limit(limit)
-          .toArray();
-        const total = await productsCollection.countDocuments(query);
+          const products = await productsCollection
+            .find(query)
+            .sort({ createdAt: -1 })
+            .skip(skip)
+            .limit(limit)
+            .toArray();
+          const total = await productsCollection.countDocuments(query);
 
-        res.send({
-          success: true,
-          products,
-          totalPages: Math.ceil(total / limit),
-          currentPage: pageNum,
-          totalProducts: total,
-        });
-      } catch (error: any) {
-        res.status(500).send({ error: error.message });
-      }
-    });
+          res.send({
+            success: true,
+            products,
+            totalPages: Math.ceil(total / limit),
+            currentPage: pageNum,
+            totalProducts: total,
+          });
+        } catch (error: any) {
+          res.status(500).send({ error: error.message });
+        }
+      },
+    );
 
     // A7-2. Admin Update Product Status (Approve / Reject / Pending)
     app.patch(
       '/api/admin/products/:id/status',
+      verifyToken,
+      verifyAdmin,
       async (req: Request, res: Response) => {
         try {
           const id = req.params.id as string;
@@ -540,6 +637,8 @@ async function run() {
     // A7-2B. Admin Toggle "Featured" flag (Home Page Featured Section, max 6 at a time)
     app.patch(
       '/api/admin/products/:id/feature',
+      verifyToken,
+      verifyAdmin,
       async (req: Request, res: Response) => {
         try {
           const id = req.params.id as string;
@@ -594,45 +693,57 @@ async function run() {
     );
 
     // A7-3. Admin Get All Users
-    app.get('/api/admin/users', async (req: Request, res: Response) => {
-      try {
-        const users = await usersCollection
-          .find({})
-          .sort({ createdAt: -1 })
-          .toArray();
-        res.send({ success: true, users });
-      } catch (error: any) {
-        res.status(500).send({ success: false, error: error.message });
-      }
-    });
+    app.get(
+      '/api/admin/users',
+      verifyToken,
+      verifyAdmin,
+      async (req: Request, res: Response) => {
+        try {
+          const users = await usersCollection
+            .find({})
+            .sort({ createdAt: -1 })
+            .toArray();
+          res.send({ success: true, users });
+        } catch (error: any) {
+          res.status(500).send({ success: false, error: error.message });
+        }
+      },
+    );
 
     // A7-3B. Admin Get Single User (Profile + product count, for the user detail page)
-    app.get('/api/admin/users/:id', async (req: Request, res: Response) => {
-      try {
-        const id = req.params.id as string;
-        const user = await usersCollection.findOne(
-          ObjectId.isValid(id) ? { _id: new ObjectId(id) } : { _id: id },
-        );
+    app.get(
+      '/api/admin/users/:id',
+      verifyToken,
+      verifyAdmin,
+      async (req: Request, res: Response) => {
+        try {
+          const id = req.params.id as string;
+          const user = await usersCollection.findOne(
+            ObjectId.isValid(id) ? { _id: new ObjectId(id) } : { _id: id },
+          );
 
-        if (!user) {
-          return res
-            .status(404)
-            .send({ success: false, error: 'User not found' });
+          if (!user) {
+            return res
+              .status(404)
+              .send({ success: false, error: 'User not found' });
+          }
+
+          const productCount = await productsCollection.countDocuments({
+            userId: id,
+          });
+
+          res.send({ success: true, user, productCount });
+        } catch (error: any) {
+          res.status(500).send({ success: false, error: error.message });
         }
-
-        const productCount = await productsCollection.countDocuments({
-          userId: id,
-        });
-
-        res.send({ success: true, user, productCount });
-      } catch (error: any) {
-        res.status(500).send({ success: false, error: error.message });
-      }
-    });
+      },
+    );
 
     // A7-4. Admin Delete User (Cascading deletion of user's products, comments, likes, cart, orders)
     app.delete(
       '/api/admin/users/:userId',
+      verifyToken,
+      verifyAdmin,
       async (req: Request, res: Response) => {
         try {
           const userId = req.params.userId as string;
@@ -707,6 +818,7 @@ async function run() {
     // AI-1. Content Generator: writes a product/crop description from structured form data
     app.post(
       '/api/ai/generate-description',
+      verifyToken,
       async (req: Request, res: Response) => {
         try {
           const {
@@ -770,61 +882,67 @@ Rules:
     // AI-2. Chat Assistant: context-aware assistant with simple tool-use grounding
     // against the live products collection (agentic: it decides when to look up
     // real marketplace data before answering, instead of only generating text).
-    app.post('/api/ai/chat', async (req: Request, res: Response) => {
-      try {
-        const { message, history, context } = req.body;
-        if (!message) {
-          return res
-            .status(400)
-            .send({ success: false, error: 'Message is required' });
-        }
-
-        // --- Tool use step: ground the reply in real listings when relevant ---
-        let toolContext = '';
-        const looksLikeProductQuery =
-          /price|cost|available|stock|find|search|buy|sell|crop|machine|tractor|rice|wheat|fruit|vegetable/i.test(
-            message,
-          );
-
-        if (looksLikeProductQuery) {
-          const keywords = message
-            .split(/\s+/)
-            .filter((w: string) => w.length > 3)
-            .map((w: string) => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
-            .slice(0, 5);
-          const escapedMessage = message.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-          const regex = keywords.length ? keywords.join('|') : escapedMessage;
-
-          const matches = await productsCollection
-            .find({
-              status: { $in: ['active', 'pending'] },
-              $or: [
-                { title: { $regex: regex, $options: 'i' } },
-                { category: { $regex: regex, $options: 'i' } },
-              ],
-            })
-            .limit(5)
-            .toArray();
-
-          if (matches.length) {
-            toolContext = `\n\nLive marketplace data (use these real facts; never invent prices or availability):\n${matches
-              .map(
-                (p: any) =>
-                  `- ${p.title} | ${p.category} | Price: ${p.price}/${p.unit} | Location: ${p.location || 'N/A'}`,
-              )
-              .join('\n')}`;
+    app.post(
+      '/api/ai/chat',
+      verifyToken,
+      async (req: Request, res: Response) => {
+        try {
+          const { message, history, context } = req.body;
+          if (!message) {
+            return res
+              .status(400)
+              .send({ success: false, error: 'Message is required' });
           }
-        }
 
-        const historyText = (history || [])
-          .slice(-6)
-          .map(
-            (h: any) =>
-              `${h.role === 'user' ? 'User' : 'Assistant'}: ${h.content}`,
-          )
-          .join('\n');
+          // --- Tool use step: ground the reply in real listings when relevant ---
+          let toolContext = '';
+          const looksLikeProductQuery =
+            /price|cost|available|stock|find|search|buy|sell|crop|machine|tractor|rice|wheat|fruit|vegetable/i.test(
+              message,
+            );
 
-        const prompt = `You are "AgroBot", the in-app AI assistant for AgroVision AI — an online marketplace where farmers list crops/machinery and buyers browse them.
+          if (looksLikeProductQuery) {
+            const keywords = message
+              .split(/\s+/)
+              .filter((w: string) => w.length > 3)
+              .map((w: string) => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+              .slice(0, 5);
+            const escapedMessage = message.replace(
+              /[.*+?^${}()|[\]\\]/g,
+              '\\$&',
+            );
+            const regex = keywords.length ? keywords.join('|') : escapedMessage;
+
+            const matches = await productsCollection
+              .find({
+                status: { $in: ['active', 'pending'] },
+                $or: [
+                  { title: { $regex: regex, $options: 'i' } },
+                  { category: { $regex: regex, $options: 'i' } },
+                ],
+              })
+              .limit(5)
+              .toArray();
+
+            if (matches.length) {
+              toolContext = `\n\nLive marketplace data (use these real facts; never invent prices or availability):\n${matches
+                .map(
+                  (p: any) =>
+                    `- ${p.title} | ${p.category} | Price: ${p.price}/${p.unit} | Location: ${p.location || 'N/A'}`,
+                )
+                .join('\n')}`;
+            }
+          }
+
+          const historyText = (history || [])
+            .slice(-6)
+            .map(
+              (h: any) =>
+                `${h.role === 'user' ? 'User' : 'Assistant'}: ${h.content}`,
+            )
+            .join('\n');
+
+          const prompt = `You are "AgroBot", the in-app AI assistant for AgroVision AI — an online marketplace where farmers list crops/machinery and buyers browse them.
 Current page: ${context?.page || 'unknown'}${context?.productTitle ? ` (viewing "${context.productTitle}")` : ''}.
 
 You can: answer questions, help with navigation (Marketplace, Add Product at /dashboard/farmer/add-crop, My Products, Login/Register), and reason over the chat history for follow-up questions.
@@ -837,55 +955,59 @@ ${historyText}
 User: ${message}
 Assistant:`;
 
-        const reply = await generateTextWithAI(prompt);
+          const reply = await generateTextWithAI(prompt);
 
-        // Lightweight suggested follow-ups (kept heuristic to avoid a second paid call)
-        const suggestions = looksLikeProductQuery
-          ? [
-              'Show me the cheapest option',
-              'How do I contact the seller?',
-              'How do I list my own product?',
-            ]
-          : [
-              'Browse the marketplace',
-              'How do I add a product?',
-              'How do I create an account?',
-            ];
+          // Lightweight suggested follow-ups (kept heuristic to avoid a second paid call)
+          const suggestions = looksLikeProductQuery
+            ? [
+                'Show me the cheapest option',
+                'How do I contact the seller?',
+                'How do I list my own product?',
+              ]
+            : [
+                'Browse the marketplace',
+                'How do I add a product?',
+                'How do I create an account?',
+              ];
 
-        res.send({ success: true, reply, suggestions });
-      } catch (error: any) {
-        res.status(500).send({ success: false, error: error.message });
-        console.error('AI Chat Error Details:', error);
-      }
-    });
+          res.send({ success: true, reply, suggestions });
+        } catch (error: any) {
+          res.status(500).send({ success: false, error: error.message });
+          console.error('AI Chat Error Details:', error);
+        }
+      },
+    );
 
     // AI-3. Crop Doctor: multimodal image analysis to diagnose plant/crop health
     // from a photo. Agentic behavior: reasons over the uploaded image + farmer
     // notes, returns a structured diagnosis, and persists it so the farmer
     // builds a diagnosis history over time.
-    app.post('/api/ai/crop-doctor', async (req: Request, res: Response) => {
-      try {
-        const {
-          imageBase64,
-          mimeType,
-          imageUrl,
-          userId,
-          userName,
-          cropHint,
-          notes,
-        } = req.body;
+    app.post(
+      '/api/ai/crop-doctor',
+      verifyToken,
+      async (req: Request, res: Response) => {
+        try {
+          const {
+            imageBase64,
+            mimeType,
+            imageUrl,
+            userId,
+            userName,
+            cropHint,
+            notes,
+          } = req.body;
 
-        if (!imageBase64) {
-          return res
-            .status(400)
-            .send({ success: false, error: 'imageBase64 is required' });
-        }
+          if (!imageBase64) {
+            return res
+              .status(400)
+              .send({ success: false, error: 'imageBase64 is required' });
+          }
 
-        const cleanBase64 = imageBase64.includes(',')
-          ? imageBase64.split(',')[1]
-          : imageBase64;
+          const cleanBase64 = imageBase64.includes(',')
+            ? imageBase64.split(',')[1]
+            : imageBase64;
 
-        const prompt = `You are "AgroDoc", an expert agronomist and plant pathologist AI inside AgroVision AI, a farm marketplace app.
+          const prompt = `You are "AgroDoc", an expert agronomist and plant pathologist AI inside AgroVision AI, a farm marketplace app.
 Look carefully at the attached crop/plant photo and diagnose its health.
 ${cropHint ? `The farmer says the crop is: ${cropHint}.` : 'Identify the crop/plant yourself from the image.'}
 ${notes ? `Farmer's notes: ${notes}` : ''}
@@ -910,38 +1032,40 @@ Rules:
 - If the photo does not clearly show a plant/crop, set cropIdentified to "Unknown" and explain why in diagnosis.
 - Keep each array to 2-5 short, practical items.`;
 
-        const raw = await analyzeImageWithAI(
-          prompt,
-          cleanBase64,
-          mimeType || 'image/jpeg',
-        );
-        const analysis = safeParseAIJson(raw);
+          const raw = await analyzeImageWithAI(
+            prompt,
+            cleanBase64,
+            mimeType || 'image/jpeg',
+          );
+          const analysis = safeParseAIJson(raw);
 
-        const diagnosisDoc = {
-          userId: userId || 'anonymous',
-          userName: userName || 'Anonymous',
-          imageUrl: imageUrl || '',
-          cropHint: cropHint || '',
-          notes: notes || '',
-          analysis,
-          createdAt: new Date(),
-        };
+          const diagnosisDoc = {
+            userId: userId || 'anonymous',
+            userName: userName || 'Anonymous',
+            imageUrl: imageUrl || '',
+            cropHint: cropHint || '',
+            notes: notes || '',
+            analysis,
+            createdAt: new Date(),
+          };
 
-        const result = await diagnosesCollection.insertOne(diagnosisDoc);
+          const result = await diagnosesCollection.insertOne(diagnosisDoc);
 
-        res.send({
-          success: true,
-          diagnosis: { _id: result.insertedId, ...diagnosisDoc },
-        });
-      } catch (error: any) {
-        console.error('AI Crop Doctor Error:', error);
-        res.status(500).send({ success: false, error: error.message });
-      }
-    });
+          res.send({
+            success: true,
+            diagnosis: { _id: result.insertedId, ...diagnosisDoc },
+          });
+        } catch (error: any) {
+          console.error('AI Crop Doctor Error:', error);
+          res.status(500).send({ success: false, error: error.message });
+        }
+      },
+    );
 
     // AI-3B. Diagnosis History for a farmer
     app.get(
       '/api/ai/diagnoses/:userId',
+      verifyToken,
       async (req: Request, res: Response) => {
         try {
           const userId = req.params.userId as string;
@@ -957,62 +1081,72 @@ Rules:
     );
 
     // AI-3C. Delete a diagnosis record
-    app.delete('/api/ai/diagnoses/:id', async (req: Request, res: Response) => {
-      try {
-        const id = req.params.id as string;
-        if (!ObjectId.isValid(id))
-          return res.status(400).send({ success: false, error: 'Invalid ID' });
-        await diagnosesCollection.deleteOne({ _id: new ObjectId(id) });
-        res.send({ success: true, message: 'Diagnosis deleted' });
-      } catch (error: any) {
-        res.status(500).send({ success: false, error: error.message });
-      }
-    });
+    app.delete(
+      '/api/ai/diagnoses/:id',
+      verifyToken,
+      async (req: Request, res: Response) => {
+        try {
+          const id = req.params.id as string;
+          if (!ObjectId.isValid(id))
+            return res
+              .status(400)
+              .send({ success: false, error: 'Invalid ID' });
+          await diagnosesCollection.deleteOne({ _id: new ObjectId(id) });
+          res.send({ success: true, message: 'Diagnosis deleted' });
+        } catch (error: any) {
+          res.status(500).send({ success: false, error: error.message });
+        }
+      },
+    );
 
     // AI-4. Farm Analyzer: agentic data analysis + recommendation engine.
     // Tool-use step: pulls the farmer's own live listings before reasoning, so
     // recommendations are grounded in what they actually grow, not generic advice.
-    app.post('/api/ai/farm-analyzer', async (req: Request, res: Response) => {
-      try {
-        const {
-          userId,
-          cropType,
-          soilType,
-          landSize,
-          landUnit,
-          location,
-          season,
-          budget,
-          irrigationType,
-          farmingType,
-          experience,
-        } = req.body;
+    app.post(
+      '/api/ai/farm-analyzer',
+      verifyToken,
+      async (req: Request, res: Response) => {
+        try {
+          const {
+            userId,
+            cropType,
+            soilType,
+            landSize,
+            landUnit,
+            location,
+            season,
+            budget,
+            irrigationType,
+            farmingType,
+            experience,
+          } = req.body;
 
-        if (!cropType || !soilType || !landSize) {
-          return res.status(400).send({
-            success: false,
-            error: 'cropType, soilType and landSize are required',
-          });
-        }
-
-        // --- Tool use: ground the analysis in the farmer's real listing history ---
-        let farmerContext = 'No prior listings found for this farmer.';
-        if (userId) {
-          const pastProducts = await productsCollection
-            .find({ userId })
-            .sort({ createdAt: -1 })
-            .limit(5)
-            .toArray();
-          if (pastProducts.length) {
-            farmerContext = `Farmer's recent listings on AgroVision: ${pastProducts
-              .map(
-                (p: any) => `${p.title} (${p.category}, ${p.price}/${p.unit})`,
-              )
-              .join('; ')}.`;
+          if (!cropType || !soilType || !landSize) {
+            return res.status(400).send({
+              success: false,
+              error: 'cropType, soilType and landSize are required',
+            });
           }
-        }
 
-        const prompt = `You are "AgroAnalyst", an agricultural data analyst AI inside AgroVision AI.
+          // --- Tool use: ground the analysis in the farmer's real listing history ---
+          let farmerContext = 'No prior listings found for this farmer.';
+          if (userId) {
+            const pastProducts = await productsCollection
+              .find({ userId })
+              .sort({ createdAt: -1 })
+              .limit(5)
+              .toArray();
+            if (pastProducts.length) {
+              farmerContext = `Farmer's recent listings on AgroVision: ${pastProducts
+                .map(
+                  (p: any) =>
+                    `${p.title} (${p.category}, ${p.price}/${p.unit})`,
+                )
+                .join('; ')}.`;
+            }
+          }
+
+          const prompt = `You are "AgroAnalyst", an agricultural data analyst AI inside AgroVision AI.
 Analyze this farm plan and return a structured, realistic assessment. Use real agronomic reasoning, not generic filler.
 
 Farm Plan:
@@ -1047,41 +1181,43 @@ Rules:
 - Give 2-4 riskFactors, 2-4 recommendedCrops, 2-4 fertilizerPlan entries, 3-5 timeline phases.
 - Numbers should be realistic estimates, not placeholders like 0 or 100 unless truly appropriate.`;
 
-        const raw = await generateJSONWithAI(prompt);
-        const analysis = safeParseAIJson(raw);
+          const raw = await generateJSONWithAI(prompt);
+          const analysis = safeParseAIJson(raw);
 
-        const analysisDoc = {
-          userId: userId || 'anonymous',
-          input: {
-            cropType,
-            soilType,
-            landSize,
-            landUnit,
-            location,
-            season,
-            budget,
-            irrigationType,
-            farmingType,
-            experience,
-          },
-          analysis,
-          createdAt: new Date(),
-        };
-        const result = await farmAnalysesCollection.insertOne(analysisDoc);
+          const analysisDoc = {
+            userId: userId || 'anonymous',
+            input: {
+              cropType,
+              soilType,
+              landSize,
+              landUnit,
+              location,
+              season,
+              budget,
+              irrigationType,
+              farmingType,
+              experience,
+            },
+            analysis,
+            createdAt: new Date(),
+          };
+          const result = await farmAnalysesCollection.insertOne(analysisDoc);
 
-        res.send({
-          success: true,
-          analysis: { _id: result.insertedId, ...analysisDoc },
-        });
-      } catch (error: any) {
-        console.error('AI Farm Analyzer Error:', error);
-        res.status(500).send({ success: false, error: error.message });
-      }
-    });
+          res.send({
+            success: true,
+            analysis: { _id: result.insertedId, ...analysisDoc },
+          });
+        } catch (error: any) {
+          console.error('AI Farm Analyzer Error:', error);
+          res.status(500).send({ success: false, error: error.message });
+        }
+      },
+    );
 
     // AI-4B. Recent Farm Analyses for a farmer
     app.get(
       '/api/ai/farm-analyses/:userId',
+      verifyToken,
       async (req: Request, res: Response) => {
         try {
           const userId = req.params.userId as string;
@@ -1101,62 +1237,66 @@ Rules:
      * B. LIKES & COMMENTS
      */
 
-    app.post('/api/likes/toggle', async (req: Request, res: Response) => {
-      try {
-        const { productId, userId, userName } = req.body;
-        const existing = await likesCollection.findOne({ productId });
+    app.post(
+      '/api/likes/toggle',
+      verifyToken,
+      async (req: Request, res: Response) => {
+        try {
+          const { productId, userId, userName } = req.body;
+          const existing = await likesCollection.findOne({ productId });
 
-        const userObj = {
-          userId: userId || 'anonymous',
-          userName: userName || 'Anonymous',
-        };
+          const userObj = {
+            userId: userId || 'anonymous',
+            userName: userName || 'Anonymous',
+          };
 
-        if (!existing) {
-          await likesCollection.insertOne({ productId, likedBy: [userObj] });
-          return res.send({ success: true, liked: true, likesCount: 1 });
-        }
+          if (!existing) {
+            await likesCollection.insertOne({ productId, likedBy: [userObj] });
+            return res.send({ success: true, liked: true, likesCount: 1 });
+          }
 
-        const likedByList: any[] = existing.likedBy || [];
-        const alreadyLiked = likedByList.some(
-          (u: any) =>
-            (typeof u === 'object' &&
-              (u.userId === userId || u.userName === userName)) ||
-            u === userName,
-        );
-
-        if (alreadyLiked) {
-          const updatedList = likedByList.filter(
+          const likedByList: any[] = existing.likedBy || [];
+          const alreadyLiked = likedByList.some(
             (u: any) =>
-              !(
-                (typeof u === 'object' &&
-                  (u.userId === userId || u.userName === userName)) ||
-                u === userName
-              ),
+              (typeof u === 'object' &&
+                (u.userId === userId || u.userName === userName)) ||
+              u === userName,
           );
-          await likesCollection.updateOne(
-            { productId },
-            { $set: { likedBy: updatedList } },
-          );
-          res.send({
-            success: true,
-            liked: false,
-            likesCount: updatedList.length,
-          });
-        } else {
-          await likesCollection.updateOne(
-            { productId },
-            { $push: { likedBy: userObj } },
-          );
-          res.send({
-            success: true,
-            liked: true,
-            likesCount: likedByList.length + 1,
-          });
+
+          if (alreadyLiked) {
+            const updatedList = likedByList.filter(
+              (u: any) =>
+                !(
+                  (typeof u === 'object' &&
+                    (u.userId === userId || u.userName === userName)) ||
+                  u === userName
+                ),
+            );
+            await likesCollection.updateOne(
+              { productId },
+              { $set: { likedBy: updatedList } },
+            );
+            res.send({
+              success: true,
+              liked: false,
+              likesCount: updatedList.length,
+            });
+          } else {
+            await likesCollection.updateOne(
+              { productId },
+              { $push: { likedBy: userObj } },
+            );
+            res.send({
+              success: true,
+              liked: true,
+              likesCount: likedByList.length + 1,
+            });
+          }
+        } catch (error: any) {
+          res.status(500).send({ error: error.message });
         }
-      } catch (error: any) {
-        res.status(500).send({ error: error.message });
-      }
-    });
+      },
+    );
 
     app.get('/api/likes/:productId', async (req: Request, res: Response) => {
       const doc = await likesCollection.findOne({
@@ -1178,24 +1318,28 @@ Rules:
       });
     });
 
-    app.post('/api/comments/add', async (req: Request, res: Response) => {
-      const { productId, userId, userName, userImage, comment, rating } =
-        req.body;
-      const commentData = {
-        productId,
-        userId,
-        userName,
-        userImage,
-        comment: comment.trim(),
-        rating: rating ? Math.min(5, Math.max(1, Number(rating))) : 5,
-        createdAt: new Date(),
-      };
-      const result = await commentsCollection.insertOne(commentData);
-      res.status(201).send({
-        success: true,
-        comment: { _id: result.insertedId, ...commentData },
-      });
-    });
+    app.post(
+      '/api/comments/add',
+      verifyToken,
+      async (req: Request, res: Response) => {
+        const { productId, userId, userName, userImage, comment, rating } =
+          req.body;
+        const commentData = {
+          productId,
+          userId,
+          userName,
+          userImage,
+          comment: comment.trim(),
+          rating: rating ? Math.min(5, Math.max(1, Number(rating))) : 5,
+          createdAt: new Date(),
+        };
+        const result = await commentsCollection.insertOne(commentData);
+        res.status(201).send({
+          success: true,
+          comment: { _id: result.insertedId, ...commentData },
+        });
+      },
+    );
 
     app.get('/api/comments/:productId', async (req: Request, res: Response) => {
       const comments = await commentsCollection
@@ -1205,59 +1349,89 @@ Rules:
       res.send({ success: true, comments });
     });
 
-    app.delete('/api/comments/:id', async (req: Request, res: Response) => {
-      const id = req.params.id as string;
-      if (!ObjectId.isValid(id))
-        return res.status(400).send({ error: 'Invalid ID' });
-      await commentsCollection.deleteOne({ _id: new ObjectId(id) });
-      res.send({ success: true, message: 'Comment deleted' });
-    });
+    app.delete(
+      '/api/comments/:id',
+      verifyToken,
+      async (req: Request, res: Response) => {
+        const id = req.params.id as string;
+        if (!ObjectId.isValid(id))
+          return res.status(400).send({ error: 'Invalid ID' });
+        await commentsCollection.deleteOne({ _id: new ObjectId(id) });
+        res.send({ success: true, message: 'Comment deleted' });
+      },
+    );
 
     /**
      * C. BUY REQUESTS & ORDERS ROUTES
      */
 
     // C1. Submit Buy Request (Buy Now)
-    app.post('/api/buy-requests', async (req: Request, res: Response) => {
-      try {
-        const {
-          productId,
-          productTitle,
-          mainImage,
-          price,
-          unit,
-          sellerId,
-          sellerName,
-          user,
-        } = req.body;
+    app.post(
+      '/api/buy-requests',
+      verifyToken,
+      async (req: Request, res: Response) => {
+        try {
+          const {
+            productId,
+            productTitle,
+            mainImage,
+            price,
+            unit,
+            sellerId,
+            sellerName,
+            user,
+          } = req.body;
 
-        if (!productId || !user?.userId) {
-          return res.status(400).send({
-            success: false,
-            error: 'Product ID and User info required',
-          });
-        }
-
-        const existingDoc = await buyRequestsCollection.findOne({ productId });
-
-        if (existingDoc) {
-          const userAlreadyInArray = existingDoc.users?.some(
-            (u: any) => u.userId === user.userId,
-          );
-
-          if (userAlreadyInArray) {
-            return res.send({
-              success: true,
-              message: 'Already submitted buy request for this product',
-              alreadyExists: true,
+          if (!productId || !user?.userId) {
+            return res.status(400).send({
+              success: false,
+              error: 'Product ID and User info required',
             });
           }
 
-          await buyRequestsCollection.updateOne(
-            { productId },
-            {
-              $push: {
-                users: {
+          const existingDoc = await buyRequestsCollection.findOne({
+            productId,
+          });
+
+          if (existingDoc) {
+            const userAlreadyInArray = existingDoc.users?.some(
+              (u: any) => u.userId === user.userId,
+            );
+
+            if (userAlreadyInArray) {
+              return res.send({
+                success: true,
+                message: 'Already submitted buy request for this product',
+                alreadyExists: true,
+              });
+            }
+
+            await buyRequestsCollection.updateOne(
+              { productId },
+              {
+                $push: {
+                  users: {
+                    userId: user.userId,
+                    userName: user.userName || 'Anonymous',
+                    userEmail: user.userEmail || '',
+                    userImage: user.userImage || '',
+                    status: 'pending',
+                    createdAt: new Date(),
+                  },
+                },
+              },
+            );
+          } else {
+            await buyRequestsCollection.insertOne({
+              productId,
+              productTitle: productTitle || 'Agro Product',
+              mainImage: mainImage || '',
+              price: price || 0,
+              unit: unit || 'unit',
+              sellerId: sellerId || 'anonymous',
+              sellerName: sellerName || 'AgroVision Seller',
+              users: [
+                {
                   userId: user.userId,
                   userName: user.userName || 'Anonymous',
                   userEmail: user.userEmail || '',
@@ -1265,44 +1439,25 @@ Rules:
                   status: 'pending',
                   createdAt: new Date(),
                 },
-              },
-            },
-          );
-        } else {
-          await buyRequestsCollection.insertOne({
-            productId,
-            productTitle: productTitle || 'Agro Product',
-            mainImage: mainImage || '',
-            price: price || 0,
-            unit: unit || 'unit',
-            sellerId: sellerId || 'anonymous',
-            sellerName: sellerName || 'AgroVision Seller',
-            users: [
-              {
-                userId: user.userId,
-                userName: user.userName || 'Anonymous',
-                userEmail: user.userEmail || '',
-                userImage: user.userImage || '',
-                status: 'pending',
-                createdAt: new Date(),
-              },
-            ],
-            createdAt: new Date(),
-          });
-        }
+              ],
+              createdAt: new Date(),
+            });
+          }
 
-        res.status(201).send({
-          success: true,
-          message: 'Buy request submitted successfully',
-        });
-      } catch (error: any) {
-        res.status(500).send({ success: false, error: error.message });
-      }
-    });
+          res.status(201).send({
+            success: true,
+            message: 'Buy request submitted successfully',
+          });
+        } catch (error: any) {
+          res.status(500).send({ success: false, error: error.message });
+        }
+      },
+    );
 
     // C2. Get Buy Requests by Buyer User ID (For "My Requests" page)
     app.get(
       '/api/buy-requests/user/:userId',
+      verifyToken,
       async (req: Request, res: Response) => {
         try {
           const userId = req.params.userId as string;
@@ -1335,6 +1490,7 @@ Rules:
     // C3. Get Orders for Seller ID (For "My Orders" page)
     app.get(
       '/api/buy-requests/seller/:sellerId',
+      verifyToken,
       async (req: Request, res: Response) => {
         try {
           const sellerId = req.params.sellerId as string;
@@ -1375,6 +1531,7 @@ Rules:
     // C4. Update Order Request Status (Accept / Reject)
     app.patch(
       '/api/buy-requests/status',
+      verifyToken,
       async (req: Request, res: Response) => {
         try {
           const { productId, userId, status } = req.body;
@@ -1404,6 +1561,7 @@ Rules:
     // C5. Delete Buy Request by Buyer (Removes user from array)
     app.delete(
       '/api/buy-requests/:productId/:userId',
+      verifyToken,
       async (req: Request, res: Response) => {
         try {
           const productId = req.params.productId as string;
@@ -1435,7 +1593,7 @@ Rules:
      */
 
     // D1. Add to Cart
-    app.post('/api/cart', async (req: Request, res: Response) => {
+    app.post('/api/cart', verifyToken, async (req: Request, res: Response) => {
       try {
         const {
           productId,
@@ -1516,36 +1674,41 @@ Rules:
     });
 
     // D2. Get Cart Items by User ID
-    app.get('/api/cart/:userId', async (req: Request, res: Response) => {
-      try {
-        const userId = req.params.userId as string;
-        const docs = await cartCollection
-          .find({ 'users.userId': userId })
-          .toArray();
+    app.get(
+      '/api/cart/:userId',
+      verifyToken,
+      async (req: Request, res: Response) => {
+        try {
+          const userId = req.params.userId as string;
+          const docs = await cartCollection
+            .find({ 'users.userId': userId })
+            .toArray();
 
-        const cartItems = docs.map((doc: any) => {
-          const userCart = doc.users?.find((u: any) => u.userId === userId);
-          return {
-            _id: doc._id.toString(),
-            productId: doc.productId,
-            productTitle: doc.productTitle,
-            mainImage: doc.mainImage,
-            price: doc.price,
-            unit: doc.unit,
-            category: doc.category,
-            addedAt: userCart?.addedAt || doc.createdAt,
-          };
-        });
+          const cartItems = docs.map((doc: any) => {
+            const userCart = doc.users?.find((u: any) => u.userId === userId);
+            return {
+              _id: doc._id.toString(),
+              productId: doc.productId,
+              productTitle: doc.productTitle,
+              mainImage: doc.mainImage,
+              price: doc.price,
+              unit: doc.unit,
+              category: doc.category,
+              addedAt: userCart?.addedAt || doc.createdAt,
+            };
+          });
 
-        res.send({ success: true, cartItems });
-      } catch (error: any) {
-        res.status(500).send({ success: false, error: error.message });
-      }
-    });
+          res.send({ success: true, cartItems });
+        } catch (error: any) {
+          res.status(500).send({ success: false, error: error.message });
+        }
+      },
+    );
 
     // D3. Remove Item from Cart (Removes user from array)
     app.delete(
       '/api/cart/:productId/:userId',
+      verifyToken,
       async (req: Request, res: Response) => {
         try {
           const productId = req.params.productId as string;
