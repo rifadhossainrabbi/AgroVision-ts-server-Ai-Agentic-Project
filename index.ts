@@ -237,7 +237,7 @@ async function run() {
     ) {
       try {
         const authHeader = req.headers.authorization;
-        console.log(authHeader, 'header')
+        console.log(authHeader, 'header');
         if (!authHeader || !authHeader.startsWith('Bearer ')) {
           return res
             .status(401)
@@ -245,7 +245,7 @@ async function run() {
         }
 
         const token = authHeader.split(' ')[1];
-        console.log(token, "token")
+        console.log(token, 'token');
         const session = await sessionCollection.findOne({ token });
 
         if (!session) {
@@ -303,7 +303,7 @@ async function run() {
         try {
           const productData = {
             ...req.body,
-            status: 'active',
+            status: 'pending',
             createdAt: new Date(),
             updatedAt: new Date(),
           };

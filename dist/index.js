@@ -192,12 +192,70 @@ async function run() {
         const cartCollection = db.collection('cart');
         const diagnosesCollection = db.collection('diagnoses');
         const farmAnalysesCollection = db.collection('farmAnalyses');
+        // better-auth (running on the Next.js app) writes its sessions into this
+        // same MongoDB database — we verify tokens by looking them up here rather
+        // than maintaining a separate JWT scheme.
+        const sessionCollection = db.collection('session');
         console.log('✅ AGROVISION DB: CONNECTED AND SYNCHRONIZED');
+        /**
+         * AUTH MIDDLEWARE
+         * Client sends the better-auth session token as: Authorization: Bearer <token>
+         * verifyToken checks it against the `session` collection and attaches
+         * req.userId. verifyAdmin (used after verifyToken) additionally checks
+         * that the user's role is 'admin'.
+         */
+        async function verifyToken(req, res, next) {
+            try {
+                const authHeader = req.headers.authorization;
+                console.log(authHeader, 'header');
+                if (!authHeader || !authHeader.startsWith('Bearer ')) {
+                    return res
+                        .status(401)
+                        .send({ success: false, error: 'Unauthorized: no token provided' });
+                }
+                const token = authHeader.split(' ')[1];
+                console.log(token, "token");
+                const session = await sessionCollection.findOne({ token });
+                if (!session) {
+                    return res
+                        .status(401)
+                        .send({ success: false, error: 'Unauthorized: invalid session' });
+                }
+                if (new Date(session.expiresAt).getTime() < Date.now()) {
+                    return res
+                        .status(401)
+                        .send({ success: false, error: 'Unauthorized: session expired' });
+                }
+                req.userId = session.userId?.toString();
+                next();
+            }
+            catch (error) {
+                res.status(500).send({ success: false, error: error.message });
+            }
+        }
+        async function verifyAdmin(req, res, next) {
+            try {
+                const userId = req.userId;
+                const user = await usersCollection.findOne({
+                    _id: new mongodb_1.ObjectId(userId),
+                });
+                if (!user || user.role !== 'admin') {
+                    return res.status(403).send({
+                        success: false,
+                        error: 'Forbidden: admin access required',
+                    });
+                }
+                next();
+            }
+            catch (error) {
+                res.status(500).send({ success: false, error: error.message });
+            }
+        }
         /**
          * A. PRODUCT MANAGEMENT ROUTES
          */
         // A1. Add New Product
-        app.post('/api/products/add', async (req, res) => {
+        app.post('/api/products/add', verifyToken, async (req, res) => {
             try {
                 const productData = {
                     ...req.body,
@@ -206,14 +264,16 @@ async function run() {
                     updatedAt: new Date(),
                 };
                 const result = await productsCollection.insertOne(productData);
-                res.status(201).send({ success: true, insertedId: result.insertedId });
+                res
+                    .status(201)
+                    .send({ success: true, insertedId: result.insertedId });
             }
             catch (error) {
                 res.status(500).send({ success: false, error: error.message });
             }
         });
         // A2. Get Products for specific user (Pagination)
-        app.get('/api/my-products/:userId', async (req, res) => {
+        app.get('/api/my-products/:userId', verifyToken, async (req, res) => {
             try {
                 const userId = req.params.userId;
                 const page = parseInt(req.query.page) || 1;
@@ -250,7 +310,7 @@ async function run() {
             await buyRequestsCollection.deleteMany({ productId });
         }
         // A3. Delete Product (Cascading Deletion of related likes, comments, cart, orders)
-        app.delete('/api/products/:id', async (req, res) => {
+        app.delete('/api/products/:id', verifyToken, async (req, res) => {
             try {
                 const id = req.params.id;
                 await deleteProductCascading(id);
@@ -264,7 +324,7 @@ async function run() {
             }
         });
         // A4. Update Product (FIXED TYPE ERROR)
-        app.patch('/api/products/:id', async (req, res) => {
+        app.patch('/api/products/:id', verifyToken, async (req, res) => {
             try {
                 const id = req.params.id; // Explicit cast to string
                 if (!mongodb_1.ObjectId.isValid(id)) {
@@ -426,7 +486,7 @@ async function run() {
          * A7. ADMIN MANAGEMENT ROUTES
          */
         // A7-1. Admin Get All Products (Includes pending, active, rejected with pagination & filtering)
-        app.get('/api/admin/products/all', async (req, res) => {
+        app.get('/api/admin/products/all', verifyToken, verifyAdmin, async (req, res) => {
             try {
                 const { search, type, category, status, page } = req.query;
                 const pageNum = parseInt(page) || 1;
@@ -461,7 +521,7 @@ async function run() {
             }
         });
         // A7-2. Admin Update Product Status (Approve / Reject / Pending)
-        app.patch('/api/admin/products/:id/status', async (req, res) => {
+        app.patch('/api/admin/products/:id/status', verifyToken, verifyAdmin, async (req, res) => {
             try {
                 const id = req.params.id;
                 const { status } = req.body;
@@ -482,7 +542,7 @@ async function run() {
             }
         });
         // A7-2B. Admin Toggle "Featured" flag (Home Page Featured Section, max 6 at a time)
-        app.patch('/api/admin/products/:id/feature', async (req, res) => {
+        app.patch('/api/admin/products/:id/feature', verifyToken, verifyAdmin, async (req, res) => {
             try {
                 const id = req.params.id;
                 const { featured } = req.body;
@@ -527,7 +587,7 @@ async function run() {
             }
         });
         // A7-3. Admin Get All Users
-        app.get('/api/admin/users', async (req, res) => {
+        app.get('/api/admin/users', verifyToken, verifyAdmin, async (req, res) => {
             try {
                 const users = await usersCollection
                     .find({})
@@ -540,7 +600,7 @@ async function run() {
             }
         });
         // A7-3B. Admin Get Single User (Profile + product count, for the user detail page)
-        app.get('/api/admin/users/:id', async (req, res) => {
+        app.get('/api/admin/users/:id', verifyToken, verifyAdmin, async (req, res) => {
             try {
                 const id = req.params.id;
                 const user = await usersCollection.findOne(mongodb_1.ObjectId.isValid(id) ? { _id: new mongodb_1.ObjectId(id) } : { _id: id });
@@ -559,7 +619,7 @@ async function run() {
             }
         });
         // A7-4. Admin Delete User (Cascading deletion of user's products, comments, likes, cart, orders)
-        app.delete('/api/admin/users/:userId', async (req, res) => {
+        app.delete('/api/admin/users/:userId', verifyToken, verifyAdmin, async (req, res) => {
             try {
                 const userId = req.params.userId;
                 // 1. Delete all products created by user & run cascading deletion for each
@@ -610,7 +670,7 @@ async function run() {
          * (4) AI Farm Analyzer      -> /api/ai/farm-analyzer (+ analysis history)
          */
         // AI-1. Content Generator: writes a product/crop description from structured form data
-        app.post('/api/ai/generate-description', async (req, res) => {
+        app.post('/api/ai/generate-description', verifyToken, async (req, res) => {
             try {
                 const { title, category, productType, price, unit, isOrganic, grade, brand, condition, highlights, length, // 'short' | 'medium' | 'long'
                  } = req.body;
@@ -654,7 +714,7 @@ Rules:
         // AI-2. Chat Assistant: context-aware assistant with simple tool-use grounding
         // against the live products collection (agentic: it decides when to look up
         // real marketplace data before answering, instead of only generating text).
-        app.post('/api/ai/chat', async (req, res) => {
+        app.post('/api/ai/chat', verifyToken, async (req, res) => {
             try {
                 const { message, history, context } = req.body;
                 if (!message) {
@@ -729,7 +789,7 @@ Assistant:`;
         // from a photo. Agentic behavior: reasons over the uploaded image + farmer
         // notes, returns a structured diagnosis, and persists it so the farmer
         // builds a diagnosis history over time.
-        app.post('/api/ai/crop-doctor', async (req, res) => {
+        app.post('/api/ai/crop-doctor', verifyToken, async (req, res) => {
             try {
                 const { imageBase64, mimeType, imageUrl, userId, userName, cropHint, notes, } = req.body;
                 if (!imageBase64) {
@@ -787,7 +847,7 @@ Rules:
             }
         });
         // AI-3B. Diagnosis History for a farmer
-        app.get('/api/ai/diagnoses/:userId', async (req, res) => {
+        app.get('/api/ai/diagnoses/:userId', verifyToken, async (req, res) => {
             try {
                 const userId = req.params.userId;
                 const diagnoses = await diagnosesCollection
@@ -801,11 +861,13 @@ Rules:
             }
         });
         // AI-3C. Delete a diagnosis record
-        app.delete('/api/ai/diagnoses/:id', async (req, res) => {
+        app.delete('/api/ai/diagnoses/:id', verifyToken, async (req, res) => {
             try {
                 const id = req.params.id;
                 if (!mongodb_1.ObjectId.isValid(id))
-                    return res.status(400).send({ success: false, error: 'Invalid ID' });
+                    return res
+                        .status(400)
+                        .send({ success: false, error: 'Invalid ID' });
                 await diagnosesCollection.deleteOne({ _id: new mongodb_1.ObjectId(id) });
                 res.send({ success: true, message: 'Diagnosis deleted' });
             }
@@ -816,7 +878,7 @@ Rules:
         // AI-4. Farm Analyzer: agentic data analysis + recommendation engine.
         // Tool-use step: pulls the farmer's own live listings before reasoning, so
         // recommendations are grounded in what they actually grow, not generic advice.
-        app.post('/api/ai/farm-analyzer', async (req, res) => {
+        app.post('/api/ai/farm-analyzer', verifyToken, async (req, res) => {
             try {
                 const { userId, cropType, soilType, landSize, landUnit, location, season, budget, irrigationType, farmingType, experience, } = req.body;
                 if (!cropType || !soilType || !landSize) {
@@ -904,7 +966,7 @@ Rules:
             }
         });
         // AI-4B. Recent Farm Analyses for a farmer
-        app.get('/api/ai/farm-analyses/:userId', async (req, res) => {
+        app.get('/api/ai/farm-analyses/:userId', verifyToken, async (req, res) => {
             try {
                 const userId = req.params.userId;
                 const analyses = await farmAnalysesCollection
@@ -921,7 +983,7 @@ Rules:
         /**
          * B. LIKES & COMMENTS
          */
-        app.post('/api/likes/toggle', async (req, res) => {
+        app.post('/api/likes/toggle', verifyToken, async (req, res) => {
             try {
                 const { productId, userId, userName } = req.body;
                 const existing = await likesCollection.findOne({ productId });
@@ -975,7 +1037,7 @@ Rules:
                 isLiked: Boolean(isLiked),
             });
         });
-        app.post('/api/comments/add', async (req, res) => {
+        app.post('/api/comments/add', verifyToken, async (req, res) => {
             const { productId, userId, userName, userImage, comment, rating } = req.body;
             const commentData = {
                 productId,
@@ -999,7 +1061,7 @@ Rules:
                 .toArray();
             res.send({ success: true, comments });
         });
-        app.delete('/api/comments/:id', async (req, res) => {
+        app.delete('/api/comments/:id', verifyToken, async (req, res) => {
             const id = req.params.id;
             if (!mongodb_1.ObjectId.isValid(id))
                 return res.status(400).send({ error: 'Invalid ID' });
@@ -1010,7 +1072,7 @@ Rules:
          * C. BUY REQUESTS & ORDERS ROUTES
          */
         // C1. Submit Buy Request (Buy Now)
-        app.post('/api/buy-requests', async (req, res) => {
+        app.post('/api/buy-requests', verifyToken, async (req, res) => {
             try {
                 const { productId, productTitle, mainImage, price, unit, sellerId, sellerName, user, } = req.body;
                 if (!productId || !user?.userId) {
@@ -1019,7 +1081,9 @@ Rules:
                         error: 'Product ID and User info required',
                     });
                 }
-                const existingDoc = await buyRequestsCollection.findOne({ productId });
+                const existingDoc = await buyRequestsCollection.findOne({
+                    productId,
+                });
                 if (existingDoc) {
                     const userAlreadyInArray = existingDoc.users?.some((u) => u.userId === user.userId);
                     if (userAlreadyInArray) {
@@ -1074,7 +1138,7 @@ Rules:
             }
         });
         // C2. Get Buy Requests by Buyer User ID (For "My Requests" page)
-        app.get('/api/buy-requests/user/:userId', async (req, res) => {
+        app.get('/api/buy-requests/user/:userId', verifyToken, async (req, res) => {
             try {
                 const userId = req.params.userId;
                 const docs = await buyRequestsCollection
@@ -1101,7 +1165,7 @@ Rules:
             }
         });
         // C3. Get Orders for Seller ID (For "My Orders" page)
-        app.get('/api/buy-requests/seller/:sellerId', async (req, res) => {
+        app.get('/api/buy-requests/seller/:sellerId', verifyToken, async (req, res) => {
             try {
                 const sellerId = req.params.sellerId;
                 const docs = await buyRequestsCollection.find({ sellerId }).toArray();
@@ -1132,7 +1196,7 @@ Rules:
             }
         });
         // C4. Update Order Request Status (Accept / Reject)
-        app.patch('/api/buy-requests/status', async (req, res) => {
+        app.patch('/api/buy-requests/status', verifyToken, async (req, res) => {
             try {
                 const { productId, userId, status } = req.body;
                 if (!productId || !userId || !status) {
@@ -1153,7 +1217,7 @@ Rules:
             }
         });
         // C5. Delete Buy Request by Buyer (Removes user from array)
-        app.delete('/api/buy-requests/:productId/:userId', async (req, res) => {
+        app.delete('/api/buy-requests/:productId/:userId', verifyToken, async (req, res) => {
             try {
                 const productId = req.params.productId;
                 const userId = req.params.userId;
@@ -1176,7 +1240,7 @@ Rules:
          * D. CART ROUTES
          */
         // D1. Add to Cart
-        app.post('/api/cart', async (req, res) => {
+        app.post('/api/cart', verifyToken, async (req, res) => {
             try {
                 const { productId, productTitle, mainImage, price, unit, category, sellerId, user, } = req.body;
                 if (!productId || !user?.userId) {
@@ -1238,7 +1302,7 @@ Rules:
             }
         });
         // D2. Get Cart Items by User ID
-        app.get('/api/cart/:userId', async (req, res) => {
+        app.get('/api/cart/:userId', verifyToken, async (req, res) => {
             try {
                 const userId = req.params.userId;
                 const docs = await cartCollection
@@ -1264,7 +1328,7 @@ Rules:
             }
         });
         // D3. Remove Item from Cart (Removes user from array)
-        app.delete('/api/cart/:productId/:userId', async (req, res) => {
+        app.delete('/api/cart/:productId/:userId', verifyToken, async (req, res) => {
             try {
                 const productId = req.params.productId;
                 const userId = req.params.userId;
