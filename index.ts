@@ -205,7 +205,7 @@ let db: any;
 async function run() {
   try {
     // Database কানেক্ট করা
-    await client.connect();
+    // await client.connect();
     db = client.db('agroVision_db');
 
     const productsCollection = db.collection('products');
